@@ -5,6 +5,8 @@
 #include "VoxelMinimal.h"
 #include "StaticMeshResources.h"
 
+class FVoxelRuntimeBulkData;
+
 namespace Voxel::Nanite
 {
 	class FCluster;
@@ -32,13 +34,16 @@ public:
 	static constexpr int32 NormalBits = 8;
 
 	bool bCompressVertices = false;
+#if VOXEL_ENGINE_VERSION == 508
+    // Opt-in page streaming; this does not construct simplified parent geometry.
+    int32 MaxResidentRootPages = MAX_int32;
+#endif
 	uint32 UniqueId = -1;
 	int32 ChunkIndex = -1;
 
-	// OutClusteredIndices will be filled only when compressing vertices;
-	// In other case, original indices array does represent clustered indices
-	TUniquePtr<FStaticMeshRenderData> CreateRenderData();
-	UStaticMesh* CreateStaticMesh();
+    // Streaming requires a fresh output owner, retained until resources/readers retire.
+    TUniquePtr<FStaticMeshRenderData> CreateRenderData(TSharedPtr<FVoxelRuntimeBulkData>* OutStreamingData = nullptr);
+    UStaticMesh* CreateStaticMesh(TSharedPtr<FVoxelRuntimeBulkData>* OutStreamingData = nullptr);
 
 public:
 	static void ApplyRenderData(
@@ -57,6 +62,7 @@ private:
 		TVoxelArray<TVoxelArray<TUniquePtr<FCluster>>>& Pages;
 		TVoxelChunkedArray<uint8>& RootData;
 		int32 NumClusters;
+        int32 NumRootPages;
 		const FVoxelBox& Bounds;
 		const uint8 NumBitsPerIndex;
 	};

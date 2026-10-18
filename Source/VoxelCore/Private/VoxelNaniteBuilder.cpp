@@ -2,6 +2,7 @@
 
 #include "VoxelNaniteBuilder.h"
 #include "VoxelNanite.h"
+#include "VoxelRuntimeBulkData.h"
 #include "Engine/StaticMesh.h"
 #include "Rendering/NaniteResources.h"
 
@@ -9,7 +10,7 @@
 #include "Nanite/NaniteFixupChunk.h"
 #endif
 
-TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
+TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedPtr<FVoxelRuntimeBulkData>* OutStreamingData)
 {
 	VOXEL_FUNCTION_COUNTER();
 	check(Mesh.Positions.Num() == Mesh.Normals.Num());
@@ -34,6 +35,13 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
 
 	TVoxelArray<TVoxelArray<TUniquePtr<FCluster>>> Pages = CreatePages(AllClusters, EncodingSettings);
 
+    int32 NumRootPages = Pages.Num();
+#if VOXEL_ENGINE_VERSION == 508
+    NumRootPages = FMath::Clamp(MaxResidentRootPages, 1, Pages.Num());
+    if (NumRootPages < Pages.Num() && !ensureMsgf(OutStreamingData && !OutStreamingData->IsValid(),
+        TEXT("Streamable Nanite data requires a fresh registration output owner")))
+        return nullptr;
+#endif
 	TVoxelChunkedArray<uint8> RootData;
 
 	FBuildData BuildData{
@@ -42,6 +50,7 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
 		Pages,
 		RootData,
 		AllClusters.Num(),
+        NumRootPages,
 		Bounds,
 		FMath::FloorLog2(Mesh.Positions.Num()) + 1
 	};
@@ -50,7 +59,22 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
 		return nullptr;
 	}
 
-	Resources.RootData = RootData.Array();
+    auto AllPageData = RootData.Array();
+#if VOXEL_ENGINE_VERSION == 508
+    if (NumRootPages < Pages.Num())
+    {
+        const auto& LastRoot = Resources.PageStreamingStates[NumRootPages - 1];
+        const int32 RootEnd = LastRoot.BulkOffset + LastRoot.BulkSize;
+        TArray<uint8> StreamingBytes;
+        StreamingBytes.Append(AllPageData.GetData() + RootEnd, AllPageData.Num() - RootEnd);
+        Resources.RootData.Append(AllPageData.GetData(), RootEnd);
+        for (int32 PageIndex = NumRootPages; PageIndex < Resources.PageStreamingStates.Num(); PageIndex++)
+            Resources.PageStreamingStates[PageIndex].BulkOffset -= RootEnd;
+        *OutStreamingData = FVoxelRuntimeBulkData::Bind(Resources.StreamablePages, MoveTemp(StreamingBytes));
+    }
+    else
+#endif
+        Resources.RootData = MoveTemp(AllPageData);
 	Resources.PositionPrecision = PositionPrecision;
 	Resources.NormalPrecision = NormalBits;
 	Resources.NumInputTriangles = Mesh.Indices.Num() / 3;
@@ -60,7 +84,7 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
 	Resources.NumInputTexCoords = Mesh.TextureCoordinates.Num();
 #endif
 	Resources.NumClusters = AllClusters.Num();
-	Resources.NumRootPages = Pages.Num();
+	Resources.NumRootPages = NumRootPages;
 	Resources.HierarchyRootOffsets.Add(0);
 #if VOXEL_ENGINE_VERSION >= 507
 	Resources.MeshBounds = Bounds.ToFBox3f();
@@ -93,11 +117,11 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData()
 	return RenderData;
 }
 
-UStaticMesh* FVoxelNaniteBuilder::CreateStaticMesh()
+UStaticMesh* FVoxelNaniteBuilder::CreateStaticMesh(TSharedPtr<FVoxelRuntimeBulkData>* OutStreamingData)
 {
-	VOXEL_FUNCTION_COUNTER();
-
-	return CreateStaticMesh(CreateRenderData());
+    VOXEL_FUNCTION_COUNTER();
+    auto Data = CreateRenderData(OutStreamingData);
+    return Data ? CreateStaticMesh(MoveTemp(Data)) : nullptr;
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -255,7 +279,7 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 
 			static constexpr uint32 AssemblyPartIndex = 0xFFFFFFFFu;
 			static constexpr int32 GroupPartSize = 1;
-			HierarchyNode.Misc2[LeafNodeData.NodePartIndex].ResourcePageRangeKey = Nanite::FPageRangeKey(PageIndex, 1, false, false).Value;
+			HierarchyNode.Misc2[LeafNodeData.NodePartIndex].ResourcePageRangeKey = Nanite::FPageRangeKey(PageIndex, 1, false, PageIndex >= BuildData.NumRootPages).Value;
 			HierarchyNode.Misc2[LeafNodeData.NodePartIndex].GroupPartSize_AssemblyPartIndex =
 				(AssemblyPartIndex & NANITE_HIERARCHY_MAX_ASSEMBLY_TRANSFORMS) |
 				(GroupPartSize << NANITE_HIERARCHY_ASSEMBLY_TRANSFORM_INDEX_BITS);
@@ -294,7 +318,7 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 			// Page Fixup
 			{
 				Nanite::FFixupChunk::FGroupFixup& GroupFixup = FixupChunk.GetGroupFixup(0);
-				GroupFixup.PageDependencies = Nanite::FPageRangeKey(PageIndex, 1, false, false);
+				GroupFixup.PageDependencies = Nanite::FPageRangeKey(PageIndex, 1, false, PageIndex >= BuildData.NumRootPages);
 				GroupFixup.Flags = 0u;
 				GroupFixup.FirstPartFixup = IntCastChecked<uint16>(0);
 				GroupFixup.NumPartFixups = IntCastChecked<uint16>(NumParts);
