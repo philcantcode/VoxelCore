@@ -1,4 +1,4 @@
-// Copyright Voxel Plugin SAS. All Rights Reserved.
+// Distributed under the repository's MIT license.
 #include "VoxelRuntimeBulkData.h"
 #if VOXEL_ENGINE_VERSION == 508
 #include "IO/IoDispatcherBackend.h"
@@ -120,12 +120,14 @@ private:
 
 namespace
 {
+FCriticalSection RuntimeBackendLock;
 TSharedPtr<FVoxelRuntimeBulkDataBackend> RuntimeBackend;
 }
 void FVoxelRuntimeBulkData::Initialize()
 {
     check(IsInGameThread());
     check(FIoDispatcher::IsInitialized());
+    FScopeLock Lock(&RuntimeBackendLock);
     if (!RuntimeBackend)
     {
         RuntimeBackend = MakeShared<FVoxelRuntimeBulkDataBackend>();
@@ -136,13 +138,17 @@ void FVoxelRuntimeBulkData::Shutdown()
 {
     // The dispatcher retains its mounted backend until its own shutdown.
     // The module disallows dynamic unloading while that vtable is registered.
+    FScopeLock Lock(&RuntimeBackendLock);
     RuntimeBackend.Reset();
 }
 TSharedRef<FVoxelRuntimeBulkData> FVoxelRuntimeBulkData::Bind(FBulkData& BulkData, TArray<uint8> Bytes)
 {
-    check(RuntimeBackend);
+    const auto Provider = [] {
+        FScopeLock Lock(&RuntimeBackendLock);
+        check(RuntimeBackend);
+        return RuntimeBackend.ToSharedRef();
+    }();
     check(BulkData.GetBulkDataSize() == 0 && !BulkData.CreateChunkId().IsValid());
-    const TSharedRef<FVoxelRuntimeBulkDataBackend> Provider = RuntimeBackend.ToSharedRef();
     const auto Payload = MakeShared<const TArray<uint8>>(MoveTemp(Bytes));
     const FIoChunkId Id = Provider->Add(Payload);
     auto& Meta = PrivateAccess::BulkMeta(BulkData);

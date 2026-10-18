@@ -1,4 +1,4 @@
-// Copyright Voxel Plugin SAS. All Rights Reserved.
+// Distributed under the repository's MIT license.
 #pragma once
 #include "VoxelCoreMinimal.h"
 #include "IO/IoChunkId.h"
