@@ -146,21 +146,22 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 	const int32 TreeDepth = FMath::FloorToInt32(FMath::LogX(4.f, FMath::Max(BuildData.NumClusters - 1, 1)));
 	ensure(TreeDepth < NANITE_MAX_CLUSTER_HIERARCHY_DEPTH);
 
+	const auto SetHierarchyBounds = [](Nanite::FPackedHierarchyNode& Node, const int32 Part, const FVoxelBox& Bounds)
+	{
+		Node.LODBounds[Part] = FVector4f(FVector3f(Bounds.GetCenter()), Bounds.Size().Length());
+		Node.Misc0[Part].BoxBoundsCenter = FVector3f(Bounds.GetCenter());
+		Node.Misc1[Part].BoxBoundsExtent = FVector3f(Bounds.GetExtent());
+	};
+
 	const auto MakeHierarchyNode = [&]
 	{
 		Nanite::FPackedHierarchyNode HierarchyNode;
 
 		for (int32 Index = 0; Index < 4; Index++)
 		{
-			HierarchyNode.LODBounds[Index] = FVector4f(
-				BuildData.Bounds.GetCenter().X,
-				BuildData.Bounds.GetCenter().Y,
-				BuildData.Bounds.GetCenter().Z,
-				BuildData.Bounds.Size().Length());
+			SetHierarchyBounds(HierarchyNode, Index, BuildData.Bounds);
 
 			HierarchyNode.Misc0[Index].MinLODError_MaxParentLODError = FFloat16(1e10f).Encoded | (FFloat16(-1).Encoded << 16);
-			HierarchyNode.Misc0[Index].BoxBoundsCenter = FVector3f(BuildData.Bounds.GetCenter());
-			HierarchyNode.Misc1[Index].BoxBoundsExtent = FVector3f(BuildData.Bounds.GetExtent());
 			HierarchyNode.Misc1[Index].ChildStartReference = 0xFFFFFFFF;
 			HierarchyNode.Misc2[Index].ResourcePageRangeKey = NANITE_PAGE_RANGE_KEY_EMPTY_RANGE;
 			HierarchyNode.Misc2[Index].GroupPartSize_AssemblyPartIndex = 0;
@@ -245,7 +246,7 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 			Nanite::FPackedHierarchyNode& HierarchyNode = BuildData.Resources.HierarchyNodes[LeafNodeData.HierarchyNodeIndex];
 
 			const FVoxelBox& ClusterBounds = Cluster.GetBounds();
-			HierarchyNode.LODBounds[LeafNodeData.NodePartIndex] = FVector4f(FVector3f(ClusterBounds.GetCenter()), ClusterBounds.Size().Length());
+			SetHierarchyBounds(HierarchyNode, LeafNodeData.NodePartIndex, ClusterBounds);
 
 			ensure(HierarchyNode.Misc1[LeafNodeData.NodePartIndex].ChildStartReference == 0xFFFFFFFF);
 			ensure(
@@ -332,6 +333,30 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 		PageStreamingState.PageSize = BuildData.RootData.Num() - PageStartIndex;
 		PageStreamingState.MaxHierarchyDepth = NANITE_MAX_CLUSTER_HIERARCHY_DEPTH;
 		BuildData.Resources.PageStreamingStates.Add(PageStreamingState);
+	}
+	// Nodes are allocated breadth-first, so children are complete before their
+	// parents in this reverse walk. Empty branches keep their existing metadata.
+	TArray<FBox3f> SubtreeBounds;
+	SubtreeBounds.Init(FBox3f(ForceInit), BuildData.Resources.HierarchyNodes.Num());
+	for (int32 NodeIndex = BuildData.Resources.HierarchyNodes.Num() - 1; NodeIndex >= 0; NodeIndex--)
+	{
+		Nanite::FPackedHierarchyNode& Node = BuildData.Resources.HierarchyNodes[NodeIndex];
+		for (int32 Part = 0; Part < 4; Part++)
+		{
+			const uint32 Child = Node.Misc1[Part].ChildStartReference;
+			const bool bHasChildBounds = Child != 0xFFFFFFFFu && SubtreeBounds[Child].IsValid;
+			if (bHasChildBounds)
+			{
+				SetHierarchyBounds(Node, Part, FVoxelBox(SubtreeBounds[Child]));
+			}
+			const uint32 LeafCount = Node.Misc2[Part].GroupPartSize_AssemblyPartIndex >> NANITE_HIERARCHY_ASSEMBLY_TRANSFORM_INDEX_BITS;
+			if (LeafCount > 0 || bHasChildBounds)
+			{
+				const FVector3f Center = Node.Misc0[Part].BoxBoundsCenter;
+				const FVector3f Extent = Node.Misc1[Part].BoxBoundsExtent;
+				SubtreeBounds[NodeIndex] += FBox3f(Center - Extent, Center + Extent);
+			}
+		}
 	}
 	return true;
 }
