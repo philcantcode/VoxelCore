@@ -7,14 +7,14 @@ class FBulkData;
 class FVoxelRuntimeBulkDataBackend;
 
 #if VOXEL_ENGINE_VERSION == 508
-/** Owns an immutable runtime I/O chunk. Retain until its bulk-data readers have retired. */
+/** Owns an immutable runtime I/O chunk. Bind fresh byte-bulk metadata; retain until readers retire. */
 class VOXELCORE_API FVoxelRuntimeBulkData
 {
 public:
     // Mounting is game-thread-only and is done once by the VoxelCore module.
     static void Initialize();
     static void Shutdown();
-    static TSharedRef<FVoxelRuntimeBulkData> Bind(FBulkData& BulkData, TSharedRef<const TArray<uint8>> Bytes);
+    static TSharedRef<FVoxelRuntimeBulkData> Bind(FBulkData& BulkData, TArray<uint8> Bytes);
     ~FVoxelRuntimeBulkData();
     const FIoChunkId& GetChunkId() const { return ChunkId; }
 

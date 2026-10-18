@@ -138,19 +138,20 @@ void FVoxelRuntimeBulkData::Shutdown()
     // The module disallows dynamic unloading while that vtable is registered.
     RuntimeBackend.Reset();
 }
-TSharedRef<FVoxelRuntimeBulkData> FVoxelRuntimeBulkData::Bind(FBulkData& BulkData, TSharedRef<const TArray<uint8>> Bytes)
+TSharedRef<FVoxelRuntimeBulkData> FVoxelRuntimeBulkData::Bind(FBulkData& BulkData, TArray<uint8> Bytes)
 {
     check(RuntimeBackend);
-    const TSharedRef<FVoxelRuntimeBulkDataBackend> Backend = RuntimeBackend.ToSharedRef();
-    const FIoChunkId Id = Backend->Add(Bytes);
-    BulkData.RemoveBulkData();
+    check(BulkData.GetBulkDataSize() == 0 && !BulkData.CreateChunkId().IsValid());
+    const TSharedRef<FVoxelRuntimeBulkDataBackend> Provider = RuntimeBackend.ToSharedRef();
+    const auto Payload = MakeShared<const TArray<uint8>>(MoveTemp(Bytes));
+    const FIoChunkId Id = Provider->Add(Payload);
     auto& Meta = PrivateAccess::BulkMeta(BulkData);
-    Meta.SetSize(Bytes->Num());
+    Meta.SetSize(Payload->Num());
     Meta.SetOffset(0);
-    Meta.SetSizeOnDisk(Bytes->Num());
+    Meta.SetSizeOnDisk(Payload->Num());
     Meta.SetFlags(EBulkDataFlags(BULKDATA_UsesIoDispatcher | BULKDATA_PayloadAtEndOfFile | BULKDATA_PayloadInSeparateFile));
     PrivateAccess::BulkChunkId(BulkData) = Id;
-    return MakeShareable(new FVoxelRuntimeBulkData(Backend, Id));
+    return MakeShareable(new FVoxelRuntimeBulkData(Provider, Id));
 }
 FVoxelRuntimeBulkData::FVoxelRuntimeBulkData(TSharedRef<FVoxelRuntimeBulkDataBackend> InBackend, FIoChunkId InChunkId)
     : Backend(InBackend), ChunkId(InChunkId) {}

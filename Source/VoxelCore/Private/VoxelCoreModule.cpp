@@ -63,7 +63,9 @@ public:
 		CreateVoxelEngineVersion();
 #endif
 	}
+#if VOXEL_ENGINE_VERSION == 508
     virtual bool SupportsDynamicReloading() override { return false; }
+#endif
 	virtual void ShutdownModule() override
 	{
 #if VOXEL_ENGINE_VERSION == 508
