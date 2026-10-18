@@ -157,10 +157,10 @@ TSharedRef<FVoxelRuntimeBulkData> FVoxelRuntimeBulkData::Bind(FBulkData& BulkDat
     Meta.SetSizeOnDisk(Payload->Num());
     Meta.SetFlags(EBulkDataFlags(BULKDATA_UsesIoDispatcher | BULKDATA_PayloadAtEndOfFile | BULKDATA_PayloadInSeparateFile));
     PrivateAccess::BulkChunkId(BulkData) = Id;
-    return MakeShareable(new FVoxelRuntimeBulkData(Provider, Id));
+    return MakeShareable(new FVoxelRuntimeBulkData(Provider, Id, Payload->GetAllocatedSize()));
 }
-FVoxelRuntimeBulkData::FVoxelRuntimeBulkData(TSharedRef<FVoxelRuntimeBulkDataBackend> InBackend, FIoChunkId InChunkId)
-    : Backend(InBackend), ChunkId(InChunkId) {}
+FVoxelRuntimeBulkData::FVoxelRuntimeBulkData(TSharedRef<FVoxelRuntimeBulkDataBackend> InBackend, FIoChunkId InChunkId, uint64 InAllocatedSize)
+    : Backend(InBackend), ChunkId(InChunkId), AllocatedSize(InAllocatedSize) {}
 FVoxelRuntimeBulkData::~FVoxelRuntimeBulkData()
 {
     Backend->Remove(ChunkId);

@@ -40,7 +40,7 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
     float ParentError = 0.0f;
     int32 NumClusters = AllClusters.Num();
 #if VOXEL_ENGINE_VERSION == 508
-    bHasCoarseMesh = !CoarseMesh.Positions.IsEmpty();
+    bHasCoarseMesh = !CoarseMesh.Positions.IsEmpty() && Pages.Num() <= NANITE_PAGE_RANGE_KEY_MAX_COUNT;
     if (bHasCoarseMesh)
     {
         if (!ensure(CoarseError > 0 && FMath::IsFinite(CoarseError) &&
@@ -58,8 +58,6 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
         NumClusters += CoarseClusters.Num();
         auto CoarsePages = CreatePages(CoarseClusters, EncodingSettings);
         NumRootPages = CoarsePages.Num();
-        if (!ensure(Pages.Num() <= NANITE_PAGE_RANGE_KEY_MAX_COUNT))
-            return nullptr;
         for (auto& Page : CoarsePages)
             for (auto& Cluster : Page)
             {

@@ -17,10 +17,12 @@ public:
     static TSharedRef<FVoxelRuntimeBulkData> Bind(FBulkData& BulkData, TArray<uint8> Bytes);
     ~FVoxelRuntimeBulkData();
     const FIoChunkId& GetChunkId() const { return ChunkId; }
+    uint64 GetAllocatedSize() const { return AllocatedSize; }
 
 private:
-    FVoxelRuntimeBulkData(TSharedRef<FVoxelRuntimeBulkDataBackend> InBackend, FIoChunkId InChunkId);
+    FVoxelRuntimeBulkData(TSharedRef<FVoxelRuntimeBulkDataBackend> InBackend, FIoChunkId InChunkId, uint64 InAllocatedSize);
     TSharedRef<FVoxelRuntimeBulkDataBackend> Backend;
     FIoChunkId ChunkId;
+    uint64 AllocatedSize;
 };
 #endif
