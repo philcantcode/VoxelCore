@@ -207,6 +207,9 @@ struct FEncodingInfo
 class FCluster
 {
 public:
+    float LODError = 0.1f;
+    TOptional<FVoxelBox> GroupLODBounds;
+    TOptional<uint32> FlagsOverride;
 	TVoxelFixedArray<FVector3f, NANITE_MAX_CLUSTER_VERTICES> Positions;
 	TVoxelFixedArray<FVoxelOctahedron, NANITE_MAX_CLUSTER_VERTICES> Normals;
 	TVoxelFixedArray<FColor, NANITE_MAX_CLUSTER_VERTICES> Colors;

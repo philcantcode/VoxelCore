@@ -37,6 +37,10 @@ public:
 #if VOXEL_ENGINE_VERSION == 508
     // Opt-in page streaming; this does not construct simplified parent geometry.
     int32 MaxResidentRootPages = MAX_int32;
+    // Optional same-surface approximation. Its pages stay resident and cover the
+    // atomic detailed group until installation completes (and after eviction).
+    FMesh CoarseMesh;
+    float CoarseError = 0.0f;
 #endif
 	uint32 UniqueId = -1;
 	int32 ChunkIndex = -1;
@@ -63,13 +67,15 @@ private:
 		TVoxelChunkedArray<uint8>& RootData;
 		int32 NumClusters;
         int32 NumRootPages;
+        bool bHasCoarseMesh;
+        float CoarseError;
 		const FVoxelBox& Bounds;
 		const uint8 NumBitsPerIndex;
 	};
 
 	bool Build(FBuildData& BuildData);
 
-	TVoxelArray<TUniquePtr<FCluster>> CreateClusters() const;
+	TVoxelArray<TUniquePtr<FCluster>> CreateClusters(const FMesh& InMesh) const;
 
 	TVoxelArray<TVoxelArray<TUniquePtr<FCluster>>> CreatePages(
 		TVoxelArray<TUniquePtr<FCluster>>& Clusters,

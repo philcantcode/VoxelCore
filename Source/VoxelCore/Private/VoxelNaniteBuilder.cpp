@@ -27,7 +27,7 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
 
 	Nanite::FResources Resources;
 
-	TVoxelArray<TUniquePtr<FCluster>> AllClusters = CreateClusters();
+	TVoxelArray<TUniquePtr<FCluster>> AllClusters = CreateClusters(Mesh);
 
 	FEncodingSettings EncodingSettings;
 	EncodingSettings.PositionPrecision = PositionPrecision;
@@ -36,8 +36,51 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
 	TVoxelArray<TVoxelArray<TUniquePtr<FCluster>>> Pages = CreatePages(AllClusters, EncodingSettings);
 
     int32 NumRootPages = Pages.Num();
+    bool bHasCoarseMesh = false;
+    float ParentError = 0.0f;
+    int32 NumClusters = AllClusters.Num();
 #if VOXEL_ENGINE_VERSION == 508
-    NumRootPages = FMath::Clamp(MaxResidentRootPages, 1, Pages.Num());
+    bHasCoarseMesh = !CoarseMesh.Positions.IsEmpty();
+    if (bHasCoarseMesh)
+    {
+        if (!ensure(CoarseError > 0 && FMath::IsFinite(CoarseError) &&
+            CoarseMesh.Positions.Num() == CoarseMesh.Normals.Num() &&
+            CoarseMesh.Indices.Num() > 0 && CoarseMesh.Indices.Num() % 3 == 0))
+            return nullptr;
+        // Round upward so parent/child cuts use the same conservative half error.
+        FFloat16 HalfError(CoarseError);
+        if (float(HalfError) < CoarseError)
+            ++HalfError.Encoded;
+        ParentError = float(HalfError);
+        if (!ensure(FMath::IsFinite(ParentError)))
+            return nullptr;
+        auto CoarseClusters = CreateClusters(CoarseMesh);
+        NumClusters += CoarseClusters.Num();
+        auto CoarsePages = CreatePages(CoarseClusters, EncodingSettings);
+        NumRootPages = CoarsePages.Num();
+        if (!ensure(Pages.Num() <= NANITE_PAGE_RANGE_KEY_MAX_COUNT))
+            return nullptr;
+        for (auto& Page : CoarsePages)
+            for (auto& Cluster : Page)
+            {
+                Cluster->LODError = ParentError;
+                Cluster->GroupLODBounds = Bounds;
+                Cluster->FlagsOverride = NANITE_CLUSTER_FLAG_ROOT_GROUP |
+                    NANITE_CLUSTER_FLAG_ROOT_LEAF | NANITE_CLUSTER_FLAG_STREAMING_LEAF;
+            }
+        for (auto& Page : Pages)
+            for (auto& Cluster : Page)
+            {
+                Cluster->LODError = 0.0f;
+                Cluster->GroupLODBounds = Bounds;
+                Cluster->FlagsOverride = NANITE_CLUSTER_FLAG_FULL_LEAF |
+                    NANITE_CLUSTER_FLAG_ROOT_LEAF | NANITE_CLUSTER_FLAG_STREAMING_LEAF;
+            }
+        CoarsePages.Append(MoveTemp(Pages));
+        Pages = MoveTemp(CoarsePages);
+    }
+    else
+        NumRootPages = FMath::Clamp(MaxResidentRootPages, 1, Pages.Num());
     if (NumRootPages < Pages.Num() && !ensureMsgf(OutStreamingData && !OutStreamingData->IsValid(),
         TEXT("Streamable Nanite data requires a fresh registration output owner")))
         return nullptr;
@@ -49,8 +92,10 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
 		EncodingSettings,
 		Pages,
 		RootData,
-		AllClusters.Num(),
+		NumClusters,
         NumRootPages,
+        bHasCoarseMesh,
+        ParentError,
 		Bounds,
 		FMath::FloorLog2(Mesh.Positions.Num()) + 1
 	};
@@ -83,7 +128,7 @@ TUniquePtr<FStaticMeshRenderData> FVoxelNaniteBuilder::CreateRenderData(TSharedP
 	Resources.NumInputMeshes = 1;
 	Resources.NumInputTexCoords = Mesh.TextureCoordinates.Num();
 #endif
-	Resources.NumClusters = AllClusters.Num();
+	Resources.NumClusters = NumClusters;
 	Resources.NumRootPages = NumRootPages;
 	Resources.HierarchyRootOffsets.Add(0);
 #if VOXEL_ENGINE_VERSION >= 507
@@ -279,7 +324,18 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 
 			static constexpr uint32 AssemblyPartIndex = 0xFFFFFFFFu;
 			static constexpr int32 GroupPartSize = 1;
-			HierarchyNode.Misc2[LeafNodeData.NodePartIndex].ResourcePageRangeKey = Nanite::FPageRangeKey(PageIndex, 1, false, PageIndex >= BuildData.NumRootPages).Value;
+			const bool bParent = BuildData.bHasCoarseMesh && PageIndex < BuildData.NumRootPages;
+            const bool bDetail = BuildData.bHasCoarseMesh && !bParent;
+            if (BuildData.bHasCoarseMesh)
+            {
+                HierarchyNode.LODBounds[LeafNodeData.NodePartIndex] = FVector4f(FVector3f(BuildData.Bounds.GetCenter()), BuildData.Bounds.Size().Length());
+                HierarchyNode.Misc0[LeafNodeData.NodePartIndex].MinLODError_MaxParentLODError =
+                    FFloat16(bParent ? MAX_flt : BuildData.CoarseError).Encoded |
+                    (uint32(FFloat16(bParent ? -BuildData.CoarseError : 0.0f).Encoded) << 16);
+            }
+            HierarchyNode.Misc2[LeafNodeData.NodePartIndex].ResourcePageRangeKey = bDetail
+                ? Nanite::FPageRangeKey(BuildData.NumRootPages, BuildData.Pages.Num() - BuildData.NumRootPages, false, true).Value
+                : Nanite::FPageRangeKey(PageIndex, 1, false, PageIndex >= BuildData.NumRootPages).Value;
 			HierarchyNode.Misc2[LeafNodeData.NodePartIndex].GroupPartSize_AssemblyPartIndex =
 				(AssemblyPartIndex & NANITE_HIERARCHY_MAX_ASSEMBLY_TRANSFORMS) |
 				(GroupPartSize << NANITE_HIERARCHY_ASSEMBLY_TRANSFORM_INDEX_BITS);
@@ -290,57 +346,72 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 
 		TArray<uint8> FixupChunkData;
 
-		// Fixup
-		{
-			const uint32 NumGroups = 1;
-			const uint32 NumParts = PageClusters.Num();
-			const uint32 NumHierarchyLocations = PageClusters.Num();
-
-			const uint32 FixupChunkSize = Nanite::FFixupChunk::GetSize(
-				NumGroups,
-				NumParts,
-				0,
-				NumHierarchyLocations,
-				0,
-				0);
-			FixupChunkData.Init(0x00, FixupChunkSize);
-
-			Nanite::FFixupChunk& FixupChunk = *reinterpret_cast<Nanite::FFixupChunk*>(FixupChunkData.GetData());
-			FixupChunk.Header.Magic = NANITE_FIXUP_MAGIC;
-			FixupChunk.Header.NumGroupFixups = IntCastChecked<uint16>(NumGroups);
-			FixupChunk.Header.NumPartFixups = IntCastChecked<uint16>(NumParts);
-			FixupChunk.Header.NumClusters = IntCastChecked<uint16>(PageClusters.Num());
-			FixupChunk.Header.NumReconsiderPages = IntCastChecked<uint16>(0);
-			FixupChunk.Header.NumParentFixups = 0;
-			FixupChunk.Header.NumHierarchyLocations = NumHierarchyLocations;
-			FixupChunk.Header.NumClusterIndices = 0;
-
-			// Page Fixup
-			{
-				Nanite::FFixupChunk::FGroupFixup& GroupFixup = FixupChunk.GetGroupFixup(0);
-				GroupFixup.PageDependencies = Nanite::FPageRangeKey(PageIndex, 1, false, PageIndex >= BuildData.NumRootPages);
-				GroupFixup.Flags = 0u;
-				GroupFixup.FirstPartFixup = IntCastChecked<uint16>(0);
-				GroupFixup.NumPartFixups = IntCastChecked<uint16>(NumParts);
-				GroupFixup.FirstParentFixup = IntCastChecked<uint16>(0);
-				GroupFixup.NumParentFixups = IntCastChecked<uint16>(0);
-			}
-
-			for (int32 ClusterIndex = 0; ClusterIndex < PageClusters.Num(); ClusterIndex++)
-			{
-				// Part Fixup
-				Nanite::FFixupChunk::FPartFixup& PartFixup = FixupChunk.GetPartFixup(ClusterIndex);
-				PartFixup.PageIndex = IntCastChecked<uint16>(PageIndex);
-				PartFixup.StartClusterIndex = IntCastChecked<uint8>(ClusterIndex);
-				PartFixup.LeafCounter = IntCastChecked<uint8>(0);
-				PartFixup.FirstHierarchyLocation = ClusterIndex;
-				PartFixup.NumHierarchyLocations = IntCastChecked<uint16>(1);
-
-				// Hierarchy Location Fixup
-				const FClusterHierarchyNode& LeafNodeData = ClusterIndexToLeafNode[ClusterIndexOffset + ClusterIndex];
-				FixupChunk.GetHierarchyLocation(ClusterIndex) = Nanite::FFixupChunk::FHierarchyLocation(LeafNodeData.HierarchyNodeIndex, LeafNodeData.NodePartIndex);
-			}
-		}
+        // Root pages each own their install fixups. With a coarse cut, the last
+        // detailed page owns the atomic group's fixups; other pages reconsider it.
+        {
+            const bool bDetail = BuildData.bHasCoarseMesh && PageIndex >= BuildData.NumRootPages;
+            const bool bLastDetail = bDetail && PageIndex == BuildData.Pages.Num() - 1;
+            const bool bOwnGroup = !bDetail || bLastDetail;
+            const int32 FirstPage = bDetail ? BuildData.NumRootPages : PageIndex;
+            const int32 EndPage = bDetail ? BuildData.Pages.Num() : PageIndex + 1;
+            int32 FirstCluster = 0;
+            for (int32 Index = 0; Index < FirstPage; ++Index)
+                FirstCluster += BuildData.Pages[Index].Num();
+            int32 NumParts = 0, NumParents = 0;
+            if (bOwnGroup)
+                for (int32 Index = FirstPage; Index < EndPage; ++Index)
+                    NumParts += BuildData.Pages[Index].Num();
+            if (bLastDetail)
+                for (int32 Index = 0; Index < BuildData.NumRootPages; ++Index)
+                    NumParents += BuildData.Pages[Index].Num();
+            const int32 NumReconsider = bDetail && !bLastDetail ? 1 : 0;
+            const auto Size = Nanite::FFixupChunk::GetSize(bOwnGroup ? 1 : 0, NumParts,
+                NumParents, NumParts, NumReconsider, NumParents);
+            FixupChunkData.Init(0, Size);
+            auto& Fixup = *reinterpret_cast<Nanite::FFixupChunk*>(FixupChunkData.GetData());
+            Fixup.Header.Magic = NANITE_FIXUP_MAGIC;
+            Fixup.Header.NumGroupFixups = bOwnGroup ? 1 : 0;
+            Fixup.Header.NumPartFixups = IntCastChecked<uint16>(NumParts);
+            Fixup.Header.NumClusters = IntCastChecked<uint16>(PageClusters.Num());
+            Fixup.Header.NumParentFixups = NumParents;
+            Fixup.Header.NumHierarchyLocations = NumParts;
+            Fixup.Header.NumReconsiderPages = NumReconsider;
+            Fixup.Header.NumClusterIndices = NumParents;
+            if (NumReconsider)
+                Fixup.GetReconsiderPageIndex(0) = IntCastChecked<uint16>(BuildData.Pages.Num() - 1);
+            if (bOwnGroup)
+            {
+                auto& Group = Fixup.GetGroupFixup(0);
+                Group.PageDependencies = Nanite::FPageRangeKey(FirstPage, EndPage - FirstPage, false, bDetail || PageIndex >= BuildData.NumRootPages);
+                Group.NumPartFixups = IntCastChecked<uint16>(NumParts);
+                Group.NumParentFixups = IntCastChecked<uint16>(NumParents);
+                int32 PartIndex = 0, GlobalCluster = FirstCluster;
+                for (int32 TargetPage = FirstPage; TargetPage < EndPage; ++TargetPage)
+                    for (int32 LocalCluster = 0; LocalCluster < BuildData.Pages[TargetPage].Num(); ++LocalCluster, ++PartIndex, ++GlobalCluster)
+                    {
+                        auto& Part = Fixup.GetPartFixup(PartIndex);
+                        Part.PageIndex = IntCastChecked<uint16>(TargetPage);
+                        Part.StartClusterIndex = IntCastChecked<uint8>(LocalCluster);
+                        Part.LeafCounter = BuildData.bHasCoarseMesh && !bDetail ? 1 : 0;
+                        Part.FirstHierarchyLocation = PartIndex;
+                        Part.NumHierarchyLocations = 1;
+                        const auto& Leaf = ClusterIndexToLeafNode[GlobalCluster];
+                        Fixup.GetHierarchyLocation(PartIndex) = Nanite::FFixupChunk::FHierarchyLocation(Leaf.HierarchyNodeIndex, Leaf.NodePartIndex);
+                    }
+                int32 ParentIndex = 0;
+                for (int32 RootPage = 0; bLastDetail && RootPage < BuildData.NumRootPages; ++RootPage)
+                    for (int32 LocalCluster = 0; LocalCluster < BuildData.Pages[RootPage].Num(); ++LocalCluster, ++ParentIndex)
+                    {
+                        auto& Parent = Fixup.GetParentFixup(ParentIndex);
+                        Parent.PageIndex = IntCastChecked<uint16>(RootPage);
+                        Parent.PartFixupPageIndex = IntCastChecked<uint16>(RootPage);
+                        Parent.PartFixupIndex = IntCastChecked<uint16>(LocalCluster);
+                        Parent.NumClusterIndices = 1;
+                        Parent.FirstClusterIndex = IntCastChecked<uint16>(ParentIndex);
+                        Fixup.GetClusterIndex(ParentIndex) = IntCastChecked<uint8>(LocalCluster);
+                    }
+            }
+        }
 
 		BuildData.RootData.Append(FixupChunkData);
 
@@ -351,8 +422,11 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 			BuildData.EncodingSettings,
 			BuildData.RootData);
 
-		PageStreamingState.DependenciesStart = 0;
-		PageStreamingState.DependenciesNum = 0;
+        PageStreamingState.DependenciesStart = BuildData.Resources.PageDependencies.Num();
+        if (BuildData.bHasCoarseMesh && PageIndex >= BuildData.NumRootPages)
+            for (int32 RootPage = 0; RootPage < BuildData.NumRootPages; ++RootPage)
+                BuildData.Resources.PageDependencies.Add(IntCastChecked<uint16>(RootPage));
+        PageStreamingState.DependenciesNum = IntCastChecked<uint16>(BuildData.Resources.PageDependencies.Num() - PageStreamingState.DependenciesStart);
 		PageStreamingState.BulkSize = BuildData.RootData.Num() - PageStreamingState.BulkOffset;
 		PageStreamingState.PageSize = BuildData.RootData.Num() - PageStartIndex;
 		PageStreamingState.MaxHierarchyDepth = NANITE_MAX_CLUSTER_HIERARCHY_DEPTH;
@@ -556,7 +630,7 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 }
 #endif
 
-TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClusters() const
+TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClusters(const FMesh& InMesh) const
 {
 	VOXEL_FUNCTION_COUNTER();
 
@@ -629,9 +703,9 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 		}
 	};
 
-	const uint8 IndexSize = FMath::FloorLog2(Mesh.Positions.Num()) + 1;
+	const uint8 IndexSize = FMath::FloorLog2(InMesh.Positions.Num()) + 1;
 	int32 NewTriangleIndex = 0;
-	for (int32 TriangleIndex = 0; TriangleIndex < Mesh.Indices.Num() / 3; TriangleIndex++)
+	for (int32 TriangleIndex = 0; TriangleIndex < InMesh.Indices.Num() / 3; TriangleIndex++)
 	{
 		if (AllClusters.Num() == 0 ||
 			AllClusters.Last()->NumTriangles() == NANITE_MAX_CLUSTER_TRIANGLES ||
@@ -642,7 +716,7 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 			NewTriangleIndex = 0;
 
 			FCluster& Cluster = *AllClusters.Add_GetRef(MakeUnique<FCluster>());
-			Cluster.TextureCoordinates.SetNum(Mesh.TextureCoordinates.Num());
+			Cluster.TextureCoordinates.SetNum(InMesh.TextureCoordinates.Num());
 			Cluster.MeshIndexToClusterIndex.Reserve(NANITE_MAX_CLUSTER_TRIANGLES * 3);
 			Cluster.ExtendedData.Append(UniqueId, 32);
 			Cluster.ExtendedData.Append(ChunkIndex, 32);
@@ -660,18 +734,18 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 		{
 			const auto AddVertex = [&](int32 MeshVertexIndex)
 			{
-				const uint8 NewClusterVertex = Cluster.Positions.Add(Mesh.Positions[MeshVertexIndex]);
+				const uint8 NewClusterVertex = Cluster.Positions.Add(InMesh.Positions[MeshVertexIndex]);
 				Cluster.Indices.Add(NewClusterVertex);
-				Cluster.Normals.Add(Mesh.Normals[MeshVertexIndex]);
+				Cluster.Normals.Add(InMesh.Normals[MeshVertexIndex]);
 
-				if (Mesh.Colors.Num() > 0)
+				if (InMesh.Colors.Num() > 0)
 				{
-					Cluster.Colors.Add(Mesh.Colors[MeshVertexIndex]);
+					Cluster.Colors.Add(InMesh.Colors[MeshVertexIndex]);
 				}
 
 				for (int32 UVIndex = 0; UVIndex < Cluster.TextureCoordinates.Num(); UVIndex++)
 				{
-					Cluster.TextureCoordinates[UVIndex].Add(Mesh.TextureCoordinates[UVIndex][MeshVertexIndex]);
+					Cluster.TextureCoordinates[UVIndex].Add(InMesh.TextureCoordinates[UVIndex][MeshVertexIndex]);
 				}
 
 				Cluster.MeshIndexToClusterIndex.FindOrAdd(MeshVertexIndex) = NewClusterVertex;
@@ -679,9 +753,9 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 				Cluster.ExtendedData.Append(MeshVertexIndex, IndexSize);
 			};
 
-			AddVertex(Mesh.Indices[3 * TriangleIndex + 0]);
-			AddVertex(Mesh.Indices[3 * TriangleIndex + 1]);
-			AddVertex(Mesh.Indices[3 * TriangleIndex + 2]);
+			AddVertex(InMesh.Indices[3 * TriangleIndex + 0]);
+			AddVertex(InMesh.Indices[3 * TriangleIndex + 1]);
+			AddVertex(InMesh.Indices[3 * TriangleIndex + 2]);
 
 			Cluster.StripBitmaskDWords[3 * DWordBucket + 0] |= 1 << DWordBitInBucket;
 			continue;
@@ -696,9 +770,9 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 			return FVertex(MeshVertexIndex, true);
 		};
 
-		FVertex VertexA = MakeVertex(Mesh.Indices[3 * TriangleIndex + 0]);
-		FVertex VertexB = MakeVertex(Mesh.Indices[3 * TriangleIndex + 1]);
-		FVertex VertexC = MakeVertex(Mesh.Indices[3 * TriangleIndex + 2]);
+		FVertex VertexA = MakeVertex(InMesh.Indices[3 * TriangleIndex + 0]);
+		FVertex VertexB = MakeVertex(InMesh.Indices[3 * TriangleIndex + 1]);
+		FVertex VertexC = MakeVertex(InMesh.Indices[3 * TriangleIndex + 2]);
 
 		RotateTriangle(VertexA, VertexB, VertexC);
 
@@ -716,18 +790,18 @@ TVoxelArray<TUniquePtr<Voxel::Nanite::FCluster>> FVoxelNaniteBuilder::CreateClus
 				return;
 			}
 
-			const uint8 NewClusterVertex = Cluster.Positions.Add(Mesh.Positions[Vertex.MeshVertex]);
+			const uint8 NewClusterVertex = Cluster.Positions.Add(InMesh.Positions[Vertex.MeshVertex]);
 			Cluster.Indices.Add(NewClusterVertex);
-			Cluster.Normals.Add(Mesh.Normals[Vertex.MeshVertex]);
+			Cluster.Normals.Add(InMesh.Normals[Vertex.MeshVertex]);
 
-			if (Mesh.Colors.Num() > 0)
+			if (InMesh.Colors.Num() > 0)
 			{
-				Cluster.Colors.Add(Mesh.Colors[Vertex.MeshVertex]);
+				Cluster.Colors.Add(InMesh.Colors[Vertex.MeshVertex]);
 			}
 
 			for (int32 UVIndex = 0; UVIndex < Cluster.TextureCoordinates.Num(); UVIndex++)
 			{
-				Cluster.TextureCoordinates[UVIndex].Add(Mesh.TextureCoordinates[UVIndex][Vertex.MeshVertex]);
+				Cluster.TextureCoordinates[UVIndex].Add(InMesh.TextureCoordinates[UVIndex][Vertex.MeshVertex]);
 			}
 
 			Cluster.MeshIndexToClusterIndex.FindOrAdd(Vertex.MeshVertex) = NewClusterVertex;
