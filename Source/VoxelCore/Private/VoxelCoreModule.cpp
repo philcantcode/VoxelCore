@@ -2,6 +2,7 @@
 
 #include "VoxelMinimal.h"
 #include "VoxelSingletonManager.h"
+#include "VoxelRuntimeBulkData.h"
 #include "ShaderCore.h"
 #include "HttpModule.h"
 #include "HttpManager.h"
@@ -19,6 +20,9 @@ public:
 	virtual void StartupModule() override
 	{
 		LOG_VOXEL(Display, "VOXEL_DEBUG=%d", VOXEL_DEBUG);
+#if VOXEL_ENGINE_VERSION == 508
+        FVoxelRuntimeBulkData::Initialize();
+#endif
 
 #if WITH_EDITOR
 		// Increase the HTTP tick rate
@@ -59,8 +63,12 @@ public:
 		CreateVoxelEngineVersion();
 #endif
 	}
+    virtual bool SupportsDynamicReloading() override { return false; }
 	virtual void ShutdownModule() override
 	{
+#if VOXEL_ENGINE_VERSION == 508
+        FVoxelRuntimeBulkData::Shutdown();
+#endif
 		ensure(GIsVoxelCoreModuleLoaded);
 		GIsVoxelCoreModuleLoaded = false;
 	}
