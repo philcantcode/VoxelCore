@@ -245,7 +245,7 @@ bool FVoxelNaniteBuilder::Build(FBuildData& BuildData)
 			Nanite::FPackedHierarchyNode& HierarchyNode = BuildData.Resources.HierarchyNodes[LeafNodeData.HierarchyNodeIndex];
 
 			const FVoxelBox& ClusterBounds = Cluster.GetBounds();
-			HierarchyNode.LODBounds[LeafNodeData.NodePartIndex] = FVector4f(FVector3f(ClusterBounds.Size()), ClusterBounds.Size().Length());
+			HierarchyNode.LODBounds[LeafNodeData.NodePartIndex] = FVector4f(FVector3f(ClusterBounds.GetCenter()), ClusterBounds.Size().Length());
 
 			ensure(HierarchyNode.Misc1[LeafNodeData.NodePartIndex].ChildStartReference == 0xFFFFFFFF);
 			ensure(
